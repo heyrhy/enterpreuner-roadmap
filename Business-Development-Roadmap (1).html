@@ -1,0 +1,880 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Business Development Roadmap</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
+            color: #e0e0e0;
+            padding: 40px 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 50px;
+            padding: 30px;
+            background: linear-gradient(135deg, #16213e 0%, #0f3460 100%);
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0, 191, 255, 0.2);
+        }
+
+        .header h1 {
+            font-size: 3em;
+            background: linear-gradient(135deg, #00bfff, #00ff88);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 15px;
+            font-weight: 700;
+        }
+
+        .header p {
+            font-size: 1.2em;
+            color: #a0a0a0;
+            margin-bottom: 20px;
+        }
+
+        .download-btn {
+            background: linear-gradient(135deg, #00bfff, #0080ff);
+            color: white;
+            padding: 15px 40px;
+            border: none;
+            border-radius: 30px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 20px rgba(0, 191, 255, 0.4);
+        }
+
+        .download-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 30px rgba(0, 191, 255, 0.6);
+        }
+
+        .timeline {
+            position: relative;
+            padding: 40px 0;
+        }
+
+        .timeline::before {
+            content: '';
+            position: absolute;
+            left: 50%;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            background: linear-gradient(180deg, #00bfff, #00ff88, #ffd700);
+            transform: translateX(-50%);
+        }
+
+        .stage {
+            position: relative;
+            margin-bottom: 80px;
+            opacity: 0;
+            transform: translateY(30px);
+            animation: fadeInUp 0.6s ease forwards;
+        }
+
+        @keyframes fadeInUp {
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .stage:nth-child(1) { animation-delay: 0.1s; }
+        .stage:nth-child(2) { animation-delay: 0.2s; }
+        .stage:nth-child(3) { animation-delay: 0.3s; }
+        .stage:nth-child(4) { animation-delay: 0.4s; }
+        .stage:nth-child(5) { animation-delay: 0.5s; }
+        .stage:nth-child(6) { animation-delay: 0.6s; }
+
+        .stage-content {
+            width: 45%;
+            padding: 30px;
+            background: linear-gradient(135deg, #1e1e2e 0%, #2a2a3e 100%);
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+            border: 2px solid transparent;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+
+        .stage-content:hover {
+            border-color: #00bfff;
+            transform: scale(1.02);
+            box-shadow: 0 15px 50px rgba(0, 191, 255, 0.3);
+        }
+
+        .stage:nth-child(odd) .stage-content {
+            margin-left: auto;
+        }
+
+        .stage:nth-child(even) .stage-content {
+            margin-right: auto;
+        }
+
+        .stage-marker {
+            position: absolute;
+            left: 50%;
+            top: 30px;
+            transform: translateX(-50%);
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, #00bfff, #0080ff);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2em;
+            box-shadow: 0 0 30px rgba(0, 191, 255, 0.6);
+            z-index: 10;
+        }
+
+        .stage-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .stage-title {
+            font-size: 2em;
+            background: linear-gradient(135deg, #00bfff, #00ff88);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 700;
+        }
+
+        .stage-duration {
+            background: rgba(0, 191, 255, 0.2);
+            padding: 8px 20px;
+            border-radius: 20px;
+            color: #00bfff;
+            font-weight: 600;
+            font-size: 0.9em;
+        }
+
+        .quote {
+            font-style: italic;
+            color: #ffd700;
+            margin-bottom: 20px;
+            font-size: 1.1em;
+            padding-left: 20px;
+            border-left: 3px solid #ffd700;
+        }
+
+        .section {
+            margin-bottom: 25px;
+        }
+
+        .section-title {
+            color: #00ff88;
+            font-size: 1.2em;
+            font-weight: 600;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .skills, .tools, .resources {
+            margin-bottom: 15px;
+        }
+
+        .skills-list, .tools-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .skill-tag, .tool-tag {
+            background: rgba(0, 191, 255, 0.1);
+            border: 1px solid #00bfff;
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            color: #00bfff;
+        }
+
+        .resource-item {
+            background: rgba(0, 255, 136, 0.05);
+            border-left: 3px solid #00ff88;
+            padding: 12px 15px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            transition: all 0.3s ease;
+        }
+
+        .resource-item:hover {
+            background: rgba(0, 255, 136, 0.1);
+            transform: translateX(5px);
+        }
+
+        .resource-link {
+            color: #00ff88;
+            text-decoration: none;
+            font-weight: 600;
+            transition: color 0.3s ease;
+        }
+
+        .resource-link:hover {
+            color: #00bfff;
+        }
+
+        .milestone {
+            background: linear-gradient(135deg, rgba(255, 215, 0, 0.1), rgba(255, 215, 0, 0.05));
+            border: 2px solid #ffd700;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 20px;
+            text-align: center;
+        }
+
+        .milestone-text {
+            color: #ffd700;
+            font-weight: 700;
+            font-size: 1.1em;
+        }
+
+        .expand-btn {
+            background: rgba(0, 191, 255, 0.1);
+            border: 1px solid #00bfff;
+            color: #00bfff;
+            padding: 10px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            margin-top: 15px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .expand-btn:hover {
+            background: rgba(0, 191, 255, 0.2);
+        }
+
+        .expandable-content {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.4s ease;
+        }
+
+        .expandable-content.expanded {
+            max-height: 1000px;
+        }
+
+        @media (max-width: 968px) {
+            .timeline::before {
+                left: 30px;
+            }
+
+            .stage-content {
+                width: calc(100% - 80px);
+                margin-left: 80px !important;
+            }
+
+            .stage-marker {
+                left: 30px;
+            }
+
+            .header h1 {
+                font-size: 2em;
+            }
+        }
+
+        @media print {
+            body {
+                background: white;
+                color: black;
+            }
+
+            .download-btn {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html" data-new-gr-c-s-check-loaded="14.1258.0" data-gr-ext-installed="">
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Business Development Learning Roadmap</h1>
+            <p>Your 18-Month Journey from Novice to Successful Entrepreneur</p>
+            <button class="download-btn" onclick="downloadRoadmap()">📥 Download Roadmap</button>
+        </div>
+
+        <div class="timeline">
+            <!-- Stage 1: Foundation -->
+            <div class="stage">
+                <div class="stage-marker">💡</div>
+                <div class="stage-content">
+                    <div class="stage-header">
+                        <div class="stage-title">Foundation</div>
+                        <div class="stage-duration">0-1 Month</div>
+                    </div>
+                    <div class="quote">"Clarity before speed."</div>
+                    
+                    <div class="section">
+                        <div class="section-title">🎯 Key Skills</div>
+                        <div class="skills-list">
+                            <span class="skill-tag">Market Research</span>
+                            <span class="skill-tag">Business Models</span>
+                            <span class="skill-tag">Competitor Analysis</span>
+                            <span class="skill-tag">Problem Identification</span>
+                            <span class="skill-tag">Idea Validation</span>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">📚 Courses &amp; Resources</div>
+                        <div class="resources">
+                            <div class="resource-item">
+                                <a href="https://www.edx.org/courses" target="_blank" rel="noopener noreferrer" class="resource-link">Entrepreneurship in Emerging Economies</a> - Harvard (edX)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://www.coursera.org/search?query=business%20strategy" target="_blank" rel="noopener noreferrer" class="resource-link">Foundations of Business Strategy</a> - University of Virginia (Coursera)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://www.youtube.com/results?search_query=y+combinator+startup+school" target="_blank" rel="noopener noreferrer" class="resource-link">How to Start a Startup</a> - Y Combinator (YouTube)
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="milestone">
+                        <div class="milestone-text">🎯 Milestone: Identify Your Business Idea</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stage 2: Building Blocks -->
+            <div class="stage">
+                <div class="stage-marker">🔨</div>
+                <div class="stage-content">
+                    <div class="stage-header">
+                        <div class="stage-title">Building Blocks</div>
+                        <div class="stage-duration">2-4 Months</div>
+                    </div>
+                    <div class="quote">"Build before scale."</div>
+                    
+                    <div class="section">
+                        <div class="section-title">🎯 Key Skills</div>
+                        <div class="skills-list">
+                            <span class="skill-tag">Design Thinking</span>
+                            <span class="skill-tag">Lean Startup</span>
+                            <span class="skill-tag">Customer Validation</span>
+                            <span class="skill-tag">Prototyping</span>
+                            <span class="skill-tag">MVP Development</span>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">📚 Courses &amp; Resources</div>
+                        <div class="resources">
+                            <div class="resource-item">
+                                <a href="http://theleanstartup.com/book" target="_blank" class="resource-link">The Lean Startup</a> - Eric Ries (Book)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://www.coursera.org/learn/uva-darden-design-thinking-innovation" target="_blank" class="resource-link">Design Thinking for Innovation</a> - University of Virginia (Coursera)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://startup.google.com/" target="_blank" class="resource-link">Google Startup School</a> - Free Program by Google
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="milestone">
+                        <div class="milestone-text">🚀 Milestone: Launch MVP</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stage 3: Growth & Marketing -->
+            <div class="stage">
+                <div class="stage-marker">📈</div>
+                <div class="stage-content">
+                    <div class="stage-header">
+                        <div class="stage-title">Growth &amp; Marketing</div>
+                        <div class="stage-duration">5-8 Months</div>
+                    </div>
+                    <div class="quote">"Traction proves viability."</div>
+                    
+                    <div class="section">
+                        <div class="section-title">🎯 Key Skills</div>
+                        <div class="skills-list">
+                            <span class="skill-tag">Marketing Analytics</span>
+                            <span class="skill-tag">Storytelling</span>
+                            <span class="skill-tag">Growth Hacking</span>
+                            <span class="skill-tag">SEO</span>
+                            <span class="skill-tag">Content Strategy</span>
+                            <span class="skill-tag">Customer Retention</span>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">📚 Courses &amp; Resources</div>
+                        <div class="resources">
+                            <div class="resource-item">
+                                <a href="https://www.coursera.org/specializations/digital-marketing" target="_blank" class="resource-link">Digital Marketing Specialization</a> - University of Illinois (Coursera)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://learndigital.withgoogle.com/digitalgarage/course/digital-marketing" target="_blank" class="resource-link">Fundamentals of Digital Marketing</a> - Google Digital Garage (Free)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://academy.hubspot.com/courses/inbound-marketing" target="_blank" class="resource-link">HubSpot Inbound Marketing Certification</a> - HubSpot (Free)
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="milestone">
+                        <div class="milestone-text">💯 Milestone: First 100 Users</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stage 4: Finance & Operations -->
+            <div class="stage">
+                <div class="stage-marker">💰</div>
+                <div class="stage-content">
+                    <div class="stage-header">
+                        <div class="stage-title">Finance &amp; Operations</div>
+                        <div class="stage-duration">9-11 Months</div>
+                    </div>
+                    <div class="quote">"Profit is sustainability."</div>
+                    
+                    <div class="section">
+                        <div class="section-title">🎯 Key Skills</div>
+                        <div class="skills-list">
+                            <span class="skill-tag">Budgeting</span>
+                            <span class="skill-tag">Investment Strategy</span>
+                            <span class="skill-tag">Cost Optimization</span>
+                            <span class="skill-tag">Accounting Basics</span>
+                            <span class="skill-tag">Pricing Strategy</span>
+                            <span class="skill-tag">Supply Chain</span>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">📚 Courses &amp; Resources</div>
+                        <div class="resources">
+                            <div class="resource-item">
+                                <a href="https://www.coursera.org/learn/uva-darden-financial-accounting" target="_blank" class="resource-link">Financial Accounting Fundamentals</a> - University of Virginia (Coursera)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://www.coursera.org/learn/wharton-finance" target="_blank" class="resource-link">Entrepreneurial Finance</a> - Wharton School (Coursera)
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="milestone">
+                        <div class="milestone-text">💸 Milestone: Achieve Profitability</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stage 5: Leadership & Team Building -->
+            <div class="stage">
+                <div class="stage-marker">🧭</div>
+                <div class="stage-content">
+                    <div class="stage-header">
+                        <div class="stage-title">Leadership &amp; Team Building</div>
+                        <div class="stage-duration">12-14 Months</div>
+                    </div>
+                    <div class="quote">"Lead with purpose."</div>
+                    
+                    <div class="section">
+                        <div class="section-title">🎯 Key Skills</div>
+                        <div class="skills-list">
+                            <span class="skill-tag">Negotiation</span>
+                            <span class="skill-tag">Hiring</span>
+                            <span class="skill-tag">Leadership Development</span>
+                            <span class="skill-tag">Communication</span>
+                            <span class="skill-tag">Emotional Intelligence</span>
+                            <span class="skill-tag">Team Management</span>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">📚 Courses &amp; Resources</div>
+                        <div class="resources">
+                            <div class="resource-item">
+                                <a href="https://www.coursera.org/specializations/leading-teams" target="_blank" class="resource-link">Leading People and Teams</a> - University of Michigan (Coursera)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://www.amazon.com/Developing-Leader-Within-You-2-0/dp/0718086473" target="_blank" class="resource-link">Developing the Leader Within You</a> - John C. Maxwell (Book)
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="milestone">
+                        <div class="milestone-text">👥 Milestone: First Team Hire</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stage 6: Scaling & Innovation -->
+            <div class="stage">
+                <div class="stage-marker">🌍</div>
+                <div class="stage-content">
+                    <div class="stage-header">
+                        <div class="stage-title">Scaling &amp; Innovation</div>
+                        <div class="stage-duration">15-18 Months</div>
+                    </div>
+                    <div class="quote">"Think global, act strategic."</div>
+                    
+                    <div class="section">
+                        <div class="section-title">🎯 Key Skills</div>
+                        <div class="skills-list">
+                            <span class="skill-tag">Venture Capital</span>
+                            <span class="skill-tag">Business Scaling</span>
+                            <span class="skill-tag">Global Expansion</span>
+                            <span class="skill-tag">Strategic Partnerships</span>
+                            <span class="skill-tag">AI in Business</span>
+                            <span class="skill-tag">Innovation Systems</span>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title">📚 Courses &amp; Resources</div>
+                        <div class="resources">
+                            <div class="resource-item">
+                                <a href="https://www.coursera.org/learn/scaling-operations" target="_blank" class="resource-link">Business Scaling Strategies</a> - London Business School (Coursera)
+                            </div>
+                            <div class="resource-item">
+                                <a href="https://online.stanford.edu/courses/gsbgen-575-vc-unlocked-demystifying-venture-capital" target="_blank" class="resource-link">VC Unlocked: Silicon Valley</a> - Stanford Online (Paid)
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="milestone">
+                        <div class="milestone-text">🏆 Milestone: Scale to Multiple Markets</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function downloadRoadmap() {
+            // Create a downloadable HTML version
+            const content = document.documentElement.outerHTML;
+            const blob = new Blob([content], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'Business-Development-Roadmap.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // Add click-to-expand functionality
+        document.querySelectorAll('.stage-content').forEach(stage => {
+            stage.addEventListener('click', function(e) {
+                if (e.target.tagName !== 'A') {
+                    this.classList.toggle('expanded');
+                }
+            });
+        });
+    </script>
+
+</body><grammarly-desktop-integration data-grammarly-shadow-root="true"></grammarly-desktop-integration></html>
